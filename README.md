@@ -1,0 +1,2 @@
+# Discovering-Big-Five-Personality-Profiles-through-UMAP-and-HDBSCAN-Clustering
+Decoded Big Five personality profiles from social media language using Sentence-BERT embeddings, UMAP, and HDBSCAN clustering. Analyzed the myPersonality Facebook dataset to identify 32 semantic user groups, revealing distinct linguistic patterns and personality traits through TF-IDF analysis and population-standardized personality scores.
