@@ -1,0 +1,408 @@
+!pip install sentence-transformers umap-learn hdbscan
+!pip install emoji
+!pip install langdetect
+!pip install ydata-profiling
+
+import os
+import re
+import random
+import itertools
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import emoji
+import google.colab
+from ydata_profiling import ProfileReport
+
+# NLP, Language Detection & ML Imports
+from langdetect import detect, DetectorFactory
+from sentence_transformers import SentenceTransformer
+import umap.umap_ as umap
+import hdbscan
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction import text
+from sklearn.metrics import silhouette_score, davies_bouldin_score
+from scipy import stats
+from tqdm.notebook import tqdm
+
+# Set seed for reproducible language detection
+DetectorFactory.seed = 42
+warnings.filterwarnings('ignore')
+
+# Enable tqdm progress bars for pandas apply functions
+tqdm.pandas()
+
+google.colab.drive.mount('/content/drive')
+PROJECT_DIR = "/content/drive/MyDrive/behavioural_psychology/"
+
+df_raw = pd.read_csv(PROJECT_DIR+"mypersonality_final.csv", encoding='latin1')
+
+
+df_raw.shape
+
+# Retain essential columns
+df_clean = df_raw[["#AUTHID", "STATUS", "sEXT", "sNEU", "sAGR", "sCON", "sOPN"]].copy()
+
+profile= ProfileReport(df_clean, title="Data Quality Report of the dataset", explorative=True)
+profile.to_notebook_iframe()
+
+df_clean.dropna(subset=['STATUS'], inplace=True)
+df_clean.drop_duplicates(subset=['STATUS'], keep='last', inplace=True)
+df_clean.reset_index(drop=True, inplace=True)
+
+print(f"Loaded {len(df_clean)} unique status updates from {df_clean['#AUTHID'].nunique()} unique users.")
+
+def is_english(text_val):
+    if not isinstance(text_val, str):
+        return False
+    # Quick pre-filter: skip if the string is too short or lacks alphabetic characters
+    cleaned_temp = re.sub(r'[^a-zA-Z\s]', '', text_val).strip()
+    if len(cleaned_temp) < 10:
+         return False
+    try:
+        # Detect primary language
+        return detect(text_val) == 'en'
+    except Exception:
+        # Gracefully reject posts that cause detection errors (e.g. pure links, punctuation)
+        return False
+
+print("Filtering for English-only posts...")
+# Use progress_apply to display progress bar during language detection
+df_clean['is_en'] = df_clean['STATUS'].progress_apply(is_english)
+df_clean = df_clean[df_clean['is_en'] == True].reset_index(drop=True)
+df_clean.drop(columns=['is_en'], inplace=True)
+
+print(f"Retained {len(df_clean)} English posts from {df_clean['#AUTHID'].nunique()} unique users.")
+
+
+# 3. TEXT PRE-PROCESSING
+def clean_text_for_embedding(text_val):
+    if not isinstance(text_val, str):
+        return ""
+    # Convert emojis to text labels
+    text_val = emoji.demojize(text_val, delimiters=(" ", " "))
+    text_val = text_val.replace("_", " ").replace(":", "")
+    text_val = text_val.lower()
+    # Remove URLs, HTML, and mentions
+    text_val = re.sub(r'http\S+|www\.\S+', '', text_val)
+    text_val = re.sub(r'<.*?>', '', text_val)
+    text_val = re.sub(r'@\w+', '', text_val)
+    # Remove extra spaces
+    text_val = re.sub(r'\s+', ' ', text_val).strip()
+    return text_val
+
+df_clean['clean_status'] = df_clean['STATUS'].apply(clean_text_for_embedding)
+# Filter out empty or extremely short updates
+df_clean = df_clean[df_clean['clean_status'].str.len() > 5].reset_index(drop=True)
+
+# 2. PSYCHOMETRIC STANDARDIZATION (True Baseline Z-Scores)
+personality_cols = ['sOPN', 'sCON', 'sEXT', 'sAGR', 'sNEU']
+personality_labels = ['Openness', 'Conscientiousness', 'Extraversion', 'Agreeableness', 'Neuroticism']
+
+### STANDARD SCALER
+# Initialize StandardScaler
+scaler = StandardScaler()
+
+# Step A: Identify unique users to compute baseline population statistics
+unique_users = df_clean.drop_duplicates(subset=['#AUTHID'])
+
+# Step B: Fit the scaler on unique users to avoid user-activity bias
+scaler.fit(unique_users[personality_cols])
+
+# Step C: Scale the main dataframe (adds columns with '_scaled' suffix)
+scaled_cols = [col + '_scaled' for col in personality_cols]
+df_clean[scaled_cols] = scaler.transform(df_clean[personality_cols])
+
+# Store the global raw means for the final dual-report printouts
+global_raw_means = unique_users[personality_cols].mean()
+global_raw_means.index = personality_labels
+
+# 4. SBERT EMBEDDINGS (Post-Level)
+print("Encoding status updates with SentenceTransformer...")
+model = SentenceTransformer('all-MiniLM-L6-v2')
+# Generate embeddings directly for individual posts
+embeddings = model.encode(df_clean['clean_status'].tolist(), show_progress_bar=True)
+
+# 5. DIMENSIONALITY REDUCTION & CLUSTERING (UMAP + HDBSCAN)
+# We reduce to 5 dimensions for HDBSCAN clustering to preserve topological detail,
+# and a separate 2D projection strictly for visualization.
+
+print("Running UMAP dimensionality reduction...")
+# Moderate-dimensional reduction for clustering
+reducer_5d = umap.UMAP(
+    n_neighbors=15,
+    n_components=5,
+    metric='cosine',
+    random_state=42
+)
+embeddings_5d = reducer_5d.fit_transform(embeddings)
+
+grid = {
+    'min_cluster_size': [30, 50, 80],
+    'min_samples': [25, 35, 45],
+    'cluster_selection_epsilon': [0.0, 0.05, 0.1],
+    'cluster_selection_method': ['eom', 'leaf']
+}
+
+keys, values = zip(*grid.items())
+experiments = [dict(zip(keys, v)) for v in itertools.product(*values)]
+results = []
+
+print(f"Running Grid Search with {len(experiments)} configurations...")
+
+for params in tqdm(experiments, desc="Optimizing HDBSCAN"):
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=params['min_cluster_size'],
+        min_samples=params['min_samples'],
+        cluster_selection_epsilon=params['cluster_selection_epsilon'],
+        cluster_selection_method=params['cluster_selection_method'],
+        metric='euclidean'
+    )
+    labels = clusterer.fit_predict(embeddings_5d)
+
+    num_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    noise_pct = (labels == -1).sum() / len(labels) * 100
+
+    clustered_mask = labels != -1
+
+    sil = np.nan # Initialize silhouette score to NaN
+    db = np.nan  # Initialize davies bouldin score to NaN
+
+    # Calculate silhouette and davies_bouldin only if valid criteria are met
+    # Need at least 2 clusters (excluding noise) and some clustered points for scoring
+    if num_clusters >= 2 and clustered_mask.any():
+        # Keep the original range constraint for when scores are actually calculated
+        if num_clusters >= 3 and num_clusters <= 12:
+            sil = silhouette_score(embeddings_5d[clustered_mask], labels[clustered_mask])
+            db = davies_bouldin_score(embeddings_5d[clustered_mask], labels[clustered_mask])
+
+    results.append({
+        'min_cluster_size': params['min_cluster_size'],
+        'min_samples': params['min_samples'],
+        'cluster_selection_epsilon':params['cluster_selection_epsilon'],
+        'cluster_selection_method': params['cluster_selection_method'],
+        'num_clusters': num_clusters,
+        'noise_pct': noise_pct,
+        'silhouette': sil,
+        'davies_bouldin': db
+    })
+
+df_results = pd.DataFrame(results)
+
+# Filter criteria: keep noise level below 45% to find representative clusters
+valid_results = df_results[df_results['noise_pct'] < 45.0]
+
+if not valid_results.empty:
+    best_config = valid_results.sort_values(by='silhouette', ascending=False).iloc[0]
+else:
+    # Fallback if noise filter was too restrictive or no valid silhouette scores were computed
+    best_config = df_results.sort_values(by='silhouette', ascending=False, na_position='last').iloc[0]
+
+print("\nBest Selected Configuration:")
+print(best_config)
+
+# Run final clustering with optimized parameters
+best_clusterer = hdbscan.HDBSCAN(
+    min_cluster_size=int(best_config['min_cluster_size']),
+    min_samples=int(best_config['min_samples']),
+    cluster_selection_epsilon=float(best_config['cluster_selection_epsilon']),
+    cluster_selection_method=best_config['cluster_selection_method'],
+    metric='euclidean'
+)
+df_clean['cluster'] = best_clusterer.fit_predict(embeddings_5d)
+
+# 2D reduction for visualization
+reducer_2d  = umap.UMAP(
+    n_neighbors=15,
+    n_components=2,
+    metric='cosine',
+    random_state=42
+)
+embeddings_2d = reducer_2d .fit_transform(embeddings)
+df_clean['umap_x'] = embeddings_2d[:, 0]
+df_clean['umap_y'] = embeddings_2d[:, 1]
+
+# 6. VISUALIZATION OF CONTENT CLUSTERS
+# ----------------------------------------------------------------------
+plt.figure(figsize=(10, 7))
+# Map distinct colors for clusters and grey for noise (-1)
+unique_clusters = sorted(df_clean['cluster'].unique())
+palette = sns.color_palette("husl", len(unique_clusters) - (1 if -1 in unique_clusters else 0))
+if -1 in unique_clusters:
+    palette.insert(0, (0.75, 0.75, 0.75)) # light grey
+
+sns.scatterplot(
+    data=df_clean,
+    x='umap_x',
+    y='umap_y',
+    hue='cluster',
+    palette=palette,
+    s=15,
+    alpha=0.6,
+    edgecolor=None
+)
+plt.title('Content Clusters Projected in 2D UMAP Space', fontsize=14)
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', title="Cluster")
+plt.tight_layout()
+plt.show()
+
+#7. PERSONALITY PROFILE ANALYSIS (STANDARDIZED SCALING)
+# ----------------------------------------------------------------------
+clustered_only = df_clean[df_clean['cluster'] != -1]
+
+# Calculate the mean standardized score for each trait inside each cluster
+cluster_scaled_means = clustered_only.groupby('cluster')[scaled_cols].mean()
+cluster_scaled_means.columns = personality_labels
+
+# Calculate raw means alongside for dual reporting
+cluster_raw_means = clustered_only.groupby('cluster')[personality_cols].mean()
+cluster_raw_means.columns = personality_labels
+
+print("\n--- Standardized Personality Profiles (Mean Standard Deviations) per Cluster ---")
+print(cluster_scaled_means.round(3))
+
+# Plot Heatmap of Standardized Means (Centered around 0, diverging colormap)
+fig, ax = plt.subplots(figsize=(10, 6))
+sns.heatmap(
+    cluster_scaled_means,
+    annot=True,
+    cmap='coolwarm', # Blue for below average, Red for above average
+    fmt="+.2f",
+    center=0,        # Centering at 0 (the global population average)
+    ax=ax,
+    cbar_kws={'label': 'Standard Deviations from Population Baseline'}
+)
+plt.title("Standardized Personality Profiles (StandardScaler) across Content Clusters", fontsize=13)
+plt.xlabel("Standardized Big Five Personality Traits")
+plt.ylabel("Content Cluster")
+plt.tight_layout()
+plt.show()
+
+# 9. SEMANTIC INTERPRETATION (c-TF-IDF Inspired)
+# ----------------------------------------------------------------------
+print("\n=======================================================")
+print(" SEMANTIC INTERPRETATION OF CONTENT CLUSTERS")
+print("=======================================================\n")
+
+# Combine standard stopwords with social media operational noise
+social_media_stopwords = [
+    'propname', 'just', 'like', 'day', 'time', 'new', 'going', 'today',
+    'good', 'got', 'know', 'people', 'don', 'tomorrow', 'night', 'really',
+    'tonight', 'work', 'life', 'want', 'im', 'lol', 'love', 'fun', 'home',
+    'excited', 'weekend', 'week', 'days', 'way', 'think', 'feel', 'make',
+    'getting', 'happy', 'need', 'right', 'come', 'did', 'went', 'gonna',
+    'oh', 'much', 'great', 'look', 'say', 'does', 'thats', 'sleep', 'hope',
+    'bad', 'isnt', 'yall', 'ur', 'u', 'wish', 'little', 'thing', 'things'
+]
+combined_stopwords = list(text.ENGLISH_STOP_WORDS.union(social_media_stopwords))
+
+cluster_docs = clustered_only.groupby('cluster')['clean_status'].apply(lambda x: ' '.join(x)).reset_index()
+
+vectorizer = TfidfVectorizer(stop_words=combined_stopwords, max_features=3000)
+tfidf_matrix = vectorizer.fit_transform(cluster_docs['clean_status'])
+feature_names = vectorizer.get_feature_names_out()
+
+for idx, row_data in enumerate(cluster_docs['cluster']):
+    cluster_id = row_data
+
+    row_vector = tfidf_matrix.getrow(idx).toarray()[0]
+    top_indices = row_vector.argsort()[-10:][::-1]
+    top_words = [feature_names[i] for i in top_indices]
+
+    # Fetch profiles
+    scaled_scores = cluster_scaled_means.loc[cluster_id]
+    raw_scores = cluster_raw_means.loc[cluster_id]
+
+    # Identify the strongest and weakest traits based on standardized scores
+    strongest_trait = scaled_scores.idxmax()
+    strongest_val = scaled_scores.max()
+    weakest_trait = scaled_scores.idxmin()
+    weakest_val = scaled_scores.min()
+
+    sample_posts = clustered_only[clustered_only['cluster'] == cluster_id]['STATUS'].sample(n=3, random_state=42).tolist()
+
+    print(f"🌟 CONTENT ARCHETYPE: CLUSTER {cluster_id}")
+    print(f"  Keywords:  {', '.join(top_words)}")
+    print(f"  Size:      {len(clustered_only[clustered_only['cluster'] == cluster_id])} posts")
+
+    # Visual, clean table displaying both Standardized SDs and Raw scores
+
+    print(f"  Standardized Evaluation (Fully Comparable across Traits):")
+    print(f"    - Most dominant relative trait: {strongest_trait} ({strongest_val:+.3f} SD)")
+    print(f"    - Least dominant relative trait: {weakest_trait} ({weakest_val:+.3f} SD)")
+
+    print("\n  Representative Posts:")
+    for i, post in enumerate(sample_posts):
+        clean_post = post.replace('\n', ' ').strip()
+        if len(clean_post) > 100:
+            clean_post = clean_post[:100] + "..."
+        print(f"    {i+1}. \"{clean_post}\"")
+    print("\n" + "=" * 75 + "\n")
+
+# 10. CLUSTERING QUALITY EVALUATION
+# ----------------------------------------------------------------------
+print("\n=======================================================")
+print(" CLUSTERING QUALITY EVALUATION")
+print("=======================================================")
+if len(set(clustered_only['cluster'])) > 1:
+    sil = silhouette_score(embeddings_5d[clustered_only.index], clustered_only['cluster'])
+    db = davies_bouldin_score(embeddings_5d[clustered_only.index], clustered_only['cluster'])
+    print(f"Silhouette Score (calculated in 5D projection): {sil:.4f}")
+    print(f"Davies-Bouldin Index (calculated in 5D projection): {db:.4f}")
+else:
+    print("Insufficient number of clusters to run distance-based evaluation metrics.")
+
+# Focus specificamente sul cluster del rumore (-1)
+noise_df = df_clean[df_clean['cluster'] == -1]
+
+if not noise_df.empty:
+    print("\n=======================================================")
+    print(" NOISE CLUSTER (-1): SEMANTIC INTERPRETATION")
+    print("=======================================================\n")
+
+    # Raggruppa tutto il testo del cluster del rumore in un singolo "documento"
+    noise_doc = ' '.join(noise_df['clean_status'])
+
+    # Applica TF-IDF per estrarre le parole chiave principali per il cluster del rumore
+    # Usiamo lo stesso vectorizer di prima per coerenza nello spazio delle feature
+    noise_tfidf_matrix = vectorizer.transform([noise_doc]) # Usa transform, non fit_transform
+    noise_feature_names = vectorizer.get_feature_names_out()
+
+    # Ottieni i punteggi TF-IDF per il cluster del rumore
+    row_noise = noise_tfidf_matrix.getrow(0).toarray()[0]
+    # Ottieni gli indici dei 10 punteggi più alti
+    top_word_indices_noise = row_noise.argsort()[-10:][::-1]
+    top_words_noise = [noise_feature_names[idx] for idx in top_word_indices_noise]
+
+    print(f" ARCHETIPO LINGUISTICO: CLUSTER DI RUMORE (-1)")
+    print("-" * 50)
+    print(f"Parole chiave principali: {', '.join(top_words_noise)}")
+    print(f"Numero di utenti: {len(noise_df)}")
+    print("\nEsempi di didascalie (per comprendere tono/stile dal rumore):")
+
+    # Leggi 3 didascalie di esempio casuali dal cluster del rumore
+    all_captions_in_noise_cluster = []
+    for user_text in noise_df['clean_status']:
+        all_captions_in_noise_cluster.extend(user_text.split(' || '))
+
+    # Rimuovi le stringhe vuote
+    all_captions_in_noise_cluster = [cap for cap in all_captions_in_noise_cluster if len(cap.strip()) > 10]
+
+    num_samples_noise = min(3, len(all_captions_in_noise_cluster))
+    samples_noise = random.sample(all_captions_in_noise_cluster, num_samples_noise)
+    for idx, sample in enumerate(samples_noise):
+        print(f"  {idx + 1}. \"{sample}\"")
+
+    print("\n=======================================================\n")
+else:
+    print("Nessun dato del cluster di rumore (-1) trovato per l'interpretazione.")
+
+target_cluster = 30
+
+# Print all posts in this cluster
+for posts in clustered_only[clustered_only['cluster'] == target_cluster]['STATUS']:
+    for post in posts.split(' || '):
+        print(f"--> {post}")
